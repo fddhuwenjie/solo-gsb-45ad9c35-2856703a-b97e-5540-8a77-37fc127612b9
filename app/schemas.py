@@ -27,6 +27,14 @@ class FenceCreate(BaseModel):
     config: FenceConfigSchema = FenceConfigSchema()
 
 
+class FenceUpdate(FenceCreate):
+    """围栏调整请求：新边界（GeoJSON Polygon，可含孔洞）与完整判定参数。
+
+    校验规则与创建时完全一致（几何合法性 + 参数取值与迟滞带关系）；
+    名称/几何/配置均需完整提交。
+    """
+
+
 class FenceOut(BaseModel):
     id: int
     name: str

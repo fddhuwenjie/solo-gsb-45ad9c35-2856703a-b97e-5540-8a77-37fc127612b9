@@ -3,6 +3,7 @@
 基于 **FastAPI + SQLite + Shapely** 的地理围栏事件服务：
 
 - 创建**带孔多边形**围栏（GeoJSON Polygon，支持 holes），每围栏可配置判定参数
+- **调整围栏**：提交新的 GeoJSON Polygon 与完整判定参数即对存量轨迹整体重算；围栏不存在 `404`，现有门线落到新有效区域外或穿过新孔洞返回 `422` 并列出冲突门线 ID（原围栏与衍生记录不变）
 - 批量提交轨迹点（设备 ID + 时间戳 + 经纬度），**乱序点按设备时间自动重排**
 - 边界抖动去抖：可配置的**进入/离开缓冲距离**（迟滞带）+ **停留时长**（dwell）
 - 产出 `enter` / `leave` / `stay` 事件；**重复提交轨迹点不会重复产出事件**（幂等）
@@ -700,12 +701,100 @@ curl http://localhost:8000/devices/dev-001/status
 - 只重放本批受影响设备的完整轨迹，**其他设备的记录不变**；各类核验报告都由事件/穿越实时重建，更正后再次查询即为新结果；
 - 一次最多 10000 条更正，批次不能为空。
 
+### 16. 调整围栏边界与判定参数
+
+对已有围栏提交**新的 GeoJSON Polygon 与完整判定参数**（请求体结构与 `POST /fences` 相同），新边界与新的去抖规则立即对**存量轨迹**生效：该围栏所有设备的 `enter`/`leave`/`stay` 事件、当前状态与门线穿越记录按全量轨迹整体重算。
+
+沿用第 1 节围栏（含中央孔洞），先提交一批轨迹：设备在 `08:00:00` 位于界外点 `(39.894,116.294)`，`08:00:20` 进入围栏，因此只有一个 `enter` 事件。
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-001", "ts": "2026-09-22T08:00:20Z", "lat": 39.910, "lon": 116.310}
+  ]}'
+```
+
+**调整成功（200）**：把围栏外边界向西、向南各扩大约 2 公里，使原界外点也落入新有效区域，同时把离开缓冲调整为 80 米。
+
+```bash
+curl -X PUT http://localhost:8000/fences/1 \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "园区A（扩大版）",
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [
+        [[116.28, 39.88], [116.34, 39.88], [116.34, 39.94], [116.28, 39.94], [116.28, 39.88]],
+        [[116.308, 39.908], [116.312, 39.908], [116.312, 39.912], [116.308, 39.912], [116.308, 39.908]]
+      ]
+    },
+    "config": {
+      "enter_buffer_m": 0,
+      "exit_buffer_m": 80,
+      "enter_dwell_s": 10,
+      "exit_dwell_s": 10,
+      "stay_min_s": 600
+    }
+  }'
+```
+
+返回 `200` 及更新后的围栏对象（`id` 与 `created_at` 不变）。重算后 `dev-001` 的进入时刻提前到首个轨迹点：
+
+```json
+{
+  "id": 1,
+  "name": "园区A（扩大版）",
+  "geometry": { "type": "Polygon", "coordinates": [/* 新边界，含孔洞 */] },
+  "config": {
+    "enter_buffer_m": 0.0,
+    "exit_buffer_m": 80.0,
+    "enter_dwell_s": 10.0,
+    "exit_dwell_s": 10.0,
+    "stay_min_s": 600.0
+  },
+  "created_at": "2026-09-22T07:30:00Z"
+}
+```
+
+```bash
+curl 'http://localhost:8000/events?device_id=dev-001&fence_id=1'
+# [{"id": ..., "device_id": "dev-001", "fence_id": 1, "type": "enter",
+#   "ts": "2026-09-22T08:00:00Z"}]
+```
+
+**门线冲突（422）**：围栏已有门线 `1`、`2`，新边界把门线 `2` 甩到有效区域外（或被新孔洞穿过）时，整次调整被拒绝，响应列出**全部冲突门线 ID**：
+
+```bash
+curl -X PUT http://localhost:8000/fences/1 -H 'Content-Type: application/json' \
+  -d '{"name": "园区A", "geometry": { /* 门线 2 不再位于有效区域内的新 Polygon */ }, "config": {}}'
+```
+
+```json
+{
+  "detail": {
+    "message": "存在门线落到新有效区域外或穿过新孔洞，围栏调整已拒绝",
+    "conflicting_gate_ids": [2]
+  }
+}
+```
+
+**语义说明**：
+
+1. **校验沿用创建规则**：几何必须是非空、合法有效的 `Polygon`（自相交或孔洞越出外环均拒绝）；参数取值与迟滞带关系（`enter_buffer_m <= exit_buffer_m`、各值非负、`stay_min_s` 非负）与创建时完全一致。围栏不存在返回 `404`。
+2. **门线兼容校验**：调整前对围栏**现有每一条门线**按新多边形做与创建门线相同的校验——整条线必须被新有效区域 `covers`（落在新外边界上允许），且不得与任何新孔洞边界相交（接触也不允许）。任一不满足即返回 `422`，`detail.conflicting_gate_ids` 按门线 ID 升序列出全部冲突门线；**原围栏定义、事件、当前状态、门线与穿越记录均不改变**。
+3. **门线与巡检路线保留**：调整成功不删除任何门线，引用门线的巡检路线继续有效；门线按各自保存的几何在**新围栏投影原点**下重新投影，穿越记录随存量轨迹整体重算（方向名称、最小位移等门线配置不变）。
+4. **串行与原子**：调整与轨迹点摄入、坐标更正共用同一把串行锁，按同一顺序串行执行；围栏定义更新与该围栏全部设备的事件、当前状态、门线穿越重放在**同一事务内一次提交**，重算失败整体回滚（不会留下新边界配旧事件）。重算只替换该围栏的衍生记录，**其他围栏的结果不变**。
+5. **报告实时反映**：容量占用、应急清场、协同到场、接力交班与隔离冲突报告都由事件/穿越实时重建，调整成功后再次查询即反映新事件；设备当前状态接口同步刷新。
+6. **仅整体替换**：请求体中的 `name`、`geometry`、`config` 都必须完整给出（语义为整体替换）；围栏 `id` 与 `created_at` 保持不变。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/fences` | 创建围栏（GeoJSON Polygon，支持孔洞，附判定配置） |
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
+| PUT | `/fences/{id}` | 调整围栏边界与完整判定参数（对存量轨迹整体重算；门线与新边界冲突时 422 列出冲突门线 ID） |
 | DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务、协同任务、交班任务、引用它的隔离任务 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
 | POST | `/points/corrections` | 批量坐标更正（按设备 ID + 原时间戳定位；缺失/同批重复/非法坐标整批 422 拒绝，原子重放） |
@@ -767,12 +856,12 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 
 ```
 app/
-  main.py      # FastAPI 路由与摄入/重算流程、已入库轨迹点批量坐标更正
+  main.py      # FastAPI 路由与摄入/重算流程、围栏调整、已入库轨迹点批量坐标更正
   engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验、协同到场核验、设备接力交班核验、隔离冲突核验
   models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints / rendezvous_tasks / rendezvous_members / handover_tasks / handover_members / isolation_tasks / isolation_groups / isolation_group_fences）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验、接力交班核验、隔离冲突核验、批量坐标更正）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、围栏调整、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验、接力交班核验、隔离冲突核验、批量坐标更正）
 Dockerfile / docker-compose.yml
 ```
 
@@ -780,5 +869,6 @@ Dockerfile / docker-compose.yml
 
 - 事件按设备全量轨迹重算并整体替换，保证乱序/重复提交下结果一致；事件 `id` 可能随重算变化，请以 `(device_id, fence_id, type, ts)` 识别事件。门线穿越同理整体重算，请以 `(device_id, gate_id, direction, ts)` 识别。
 - 同一设备同一时间戳的轨迹点视为重复（保留首条）；需要修改已入库点的坐标时使用 `POST /points/corrections`，更正按整批原子提交并重放受影响设备的完整轨迹，`/points` 的重复忽略规则不受影响。
+- 需要修改围栏边界或判定参数时使用 `PUT /fences/{id}`：调整与摄入/更正串行执行，围栏定义与该围栏全部设备的事件、状态、门线穿越在同一事务内提交；现有门线与新边界冲突（越出新外环或穿过/接触新孔洞）时整次拒绝（`422` + 冲突门线 ID），成功后容量、清场、协同、交班、隔离报告再次查询即反映新事件。
 - 距离计算采用以围栏质心为原点的局部等距圆柱投影近似，围栏尺度（公里级）下误差可忽略。
 - 门线方向以**坐标书写顺序**为准（右→左为正向）；同一扇门反向画一遍会交换 forward/reverse 的语义，命名时请注意坐标顺序。

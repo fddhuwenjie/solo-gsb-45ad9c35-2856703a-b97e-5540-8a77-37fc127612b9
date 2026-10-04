@@ -69,6 +69,7 @@ from .schemas import (
     FenceCreate,
     FenceOut,
     FenceStateOut,
+    FenceUpdate,
     GateLineCreate,
     GateLineOut,
     HandoverReportOut,
@@ -123,9 +124,9 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验、"
+                "支持围栏边界与判定参数调整、围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验、"
                 "设备接力交班核验、隔离冲突核验与已入库轨迹点批量坐标更正",
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -151,6 +152,69 @@ def _sanitize_json(value):
 
 
 # ---------- 内部逻辑 ----------
+
+def _projected_fence(f: Fence) -> ProjectedFence:
+    """由围栏行构造投影围栏（几何 + 当前判定参数）。"""
+    polygon = shape(json.loads(f.geometry))
+    cfg = FenceConfig(
+        enter_buffer_m=f.enter_buffer_m,
+        exit_buffer_m=f.exit_buffer_m,
+        enter_dwell_s=f.enter_dwell_s,
+        exit_dwell_s=f.exit_dwell_s,
+        stay_min_s=f.stay_min_s,
+    )
+    return ProjectedFence(f.id, polygon, cfg)
+
+
+def _gate_lines(gates: list[GateLineRow], lat0: float, lon0: float) -> list[GateLine]:
+    """把门线行按围栏投影原点转换为引擎使用的米制 GateLine 列表。"""
+    lines = []
+    for g in gates:
+        coords_ll = [tuple(c[:2]) for c in json.loads(g.geometry)["coordinates"]]
+        lines.append(GateLine(
+            gate_id=g.id,
+            coords=project_points(coords_ll, lat0, lon0),
+            forward_name=g.forward_name,
+            reverse_name=g.reverse_name,
+            min_displacement_m=g.min_displacement_m,
+        ))
+    return lines
+
+
+def _write_fence_results(
+    db: Session,
+    fence: Fence,
+    pf: ProjectedFence,
+    gate_lines: list[GateLine],
+    device_points: dict[str, list[TrackPoint]],
+) -> None:
+    """按给定围栏几何/参数对一批设备的轨迹写入事件、当前状态与门线穿越。
+
+    调用方须已在同一事务内删除这些 (设备, 围栏) 的旧衍生记录；
+    本函数只做删除后的重建，不提交。
+    """
+    lat0, lon0 = pf.origin
+    for device_id, points in device_points.items():
+        events, inside, since = compute_events(pf, points)
+        for e in events:
+            db.add(Event(device_id=device_id, fence_id=e.fence_id, type=e.type, ts=e.ts))
+        db.add(DeviceState(
+            device_id=device_id,
+            fence_id=fence.id,
+            state="inside" if inside else "outside",
+            since=since,
+        ))
+        for c in compute_crossings(gate_lines, points, lat0, lon0):
+            db.add(Crossing(
+                device_id=device_id,
+                fence_id=fence.id,
+                gate_id=c.gate_id,
+                direction=c.direction,
+                ts=c.ts,
+                lat=c.lat,
+                lon=c.lon,
+            ))
+
 
 def recompute_device(db: Session, device_id: str, commit: bool = True) -> None:
     """按设备全量轨迹（按时间升序）重算该设备在所有围栏下的事件与当前状态。
@@ -179,46 +243,45 @@ def recompute_device(db: Session, device_id: str, commit: bool = True) -> None:
     db.query(Crossing).filter_by(device_id=device_id).delete()
 
     for f in fences:
-        polygon = shape(json.loads(f.geometry))
-        cfg = FenceConfig(
-            enter_buffer_m=f.enter_buffer_m,
-            exit_buffer_m=f.exit_buffer_m,
-            enter_dwell_s=f.enter_dwell_s,
-            exit_dwell_s=f.exit_dwell_s,
-            stay_min_s=f.stay_min_s,
-        )
-        pf = ProjectedFence(f.id, polygon, cfg)
-        events, inside, since = compute_events(pf, points)
-        for e in events:
-            db.add(Event(device_id=device_id, fence_id=e.fence_id, type=e.type, ts=e.ts))
-        db.add(DeviceState(
-            device_id=device_id,
-            fence_id=f.id,
-            state="inside" if inside else "outside",
-            since=since,
-        ))
-
+        pf = _projected_fence(f)
         lat0, lon0 = pf.origin
-        gate_lines = []
-        for g in gates_by_fence.get(f.id, []):
-            coords_ll = [tuple(c[:2]) for c in json.loads(g.geometry)["coordinates"]]
-            gate_lines.append(GateLine(
-                gate_id=g.id,
-                coords=project_points(coords_ll, lat0, lon0),
-                forward_name=g.forward_name,
-                reverse_name=g.reverse_name,
-                min_displacement_m=g.min_displacement_m,
-            ))
-        for c in compute_crossings(gate_lines, points, lat0, lon0):
-            db.add(Crossing(
-                device_id=device_id,
-                fence_id=f.id,
-                gate_id=c.gate_id,
-                direction=c.direction,
-                ts=c.ts,
-                lat=c.lat,
-                lon=c.lon,
-            ))
+        gate_lines = _gate_lines(gates_by_fence.get(f.id, []), lat0, lon0)
+        _write_fence_results(db, f, pf, gate_lines, {device_id: points})
+
+    if commit:
+        db.commit()
+
+
+def recompute_fence(db: Session, fence: Fence, commit: bool = True) -> None:
+    """对单个围栏按其当前几何/参数重算所有设备的事件、当前状态与门线穿越。
+
+    供围栏调整使用：只替换该围栏的衍生记录（events/device_state/crossings
+    中 fence_id 等于该围栏的部分），其他围栏的记录原样保留。门线仍按各自
+    保存的几何，仅在新投影原点下重新投影；门线穿越随新边界整体重算。
+
+    commit=False 时只在当前事务内完成删除/写入而不提交，调用方负责最终
+    commit 或 rollback（重算失败应由调用方整体回滚）。
+    """
+    pf = _projected_fence(fence)
+    lat0, lon0 = pf.origin
+    gate_rows = db.query(GateLineRow).filter_by(fence_id=fence.id).all()
+    gate_lines = _gate_lines(gate_rows, lat0, lon0)
+
+    # 每个有轨迹点的设备都必须保留一条 (device, fence) 当前状态（含 outside），
+    # 因此按设备分组取全量轨迹；没有任何轨迹点时围栏无衍生记录。
+    point_rows = db.query(TrackPointRow).order_by(TrackPointRow.ts).all()
+    points_by_device: dict[str, list[TrackPoint]] = {}
+    for r in point_rows:
+        points_by_device.setdefault(r.device_id, []).append(
+            TrackPoint(ts=r.ts, lat=r.lat, lon=r.lon)
+        )
+
+    db.query(Event).filter_by(fence_id=fence.id).delete()
+    db.query(DeviceState).filter_by(fence_id=fence.id).delete()
+    db.query(Crossing).filter_by(fence_id=fence.id).delete()
+
+    _write_fence_results(db, fence, pf, gate_lines, points_by_device)
+
     if commit:
         db.commit()
 
@@ -241,17 +304,26 @@ def fence_out(f: Fence) -> FenceOut:
 
 # ---------- 围栏管理 ----------
 
+def _fence_polygon(geometry: dict):
+    """校验围栏 GeoJSON Polygon，沿用创建时的几何校验；不通过抛 ValueError。"""
+    try:
+        geom = shape(geometry)
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError("geometry 不是合法的 GeoJSON") from exc
+    if geom.geom_type != "Polygon" or geom.is_empty:
+        raise ValueError("geometry 必须是 Polygon 类型")
+    if not geom.is_valid:
+        raise ValueError("多边形无效（自相交或孔洞越出外环）")
+    return geom
+
+
 @app.post("/fences", response_model=FenceOut, status_code=201)
 def create_fence(body: FenceCreate, db: Session = Depends(get_db)):
     """创建带孔多边形围栏。geometry 为 GeoJSON Polygon，coordinates[0] 为外环，后续为孔洞。"""
     try:
-        geom = shape(body.geometry)
-    except Exception:
-        raise HTTPException(status_code=422, detail="geometry 不是合法的 GeoJSON")
-    if geom.geom_type != "Polygon" or geom.is_empty:
-        raise HTTPException(status_code=422, detail="geometry 必须是 Polygon 类型")
-    if not geom.is_valid:
-        raise HTTPException(status_code=422, detail="多边形无效（自相交或孔洞越出外环）")
+        _fence_polygon(body.geometry)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     fence = Fence(
         name=body.name,
@@ -273,6 +345,71 @@ def create_fence(body: FenceCreate, db: Session = Depends(get_db)):
         for device_id in device_ids:
             recompute_device(db, device_id)
 
+    return fence_out(fence)
+
+
+@app.put("/fences/{fence_id}", response_model=FenceOut)
+def update_fence(fence_id: int, body: FenceUpdate, db: Session = Depends(get_db)):
+    """调整围栏的 GeoJSON Polygon 边界与完整判定参数，使新规则对存量轨迹生效。
+
+    - 几何与参数校验沿用创建围栏时的规则（Polygon 合法/有效，缓冲与 dwell
+      非负且 enter_buffer_m <= exit_buffer_m）；
+    - 围栏不存在返回 404；
+    - 围栏现有门线若整条落到新有效区域外（越出新外环）或穿过/接触新孔洞，
+      返回 422 并在 detail.conflicting_gate_ids 列出全部冲突门线 ID，
+      此时原围栏与一切衍生记录（事件、状态、门线穿越）均不改变；
+    - 调整与轨迹摄入、坐标更正共用同一把串行锁；围栏定义更新与该围栏所有
+      设备的 enter/leave/stay 事件、当前状态及门线穿越在同一事务内一次提交，
+      重算失败整体回滚，其他围栏的结果不变；
+    - 原门线与巡检路线保留可继续使用；容量、清场、协同、交班及隔离报告均
+      由事件/穿越实时重建，调整后再次查询即反映新事件。
+    """
+    with INGEST_LOCK:
+        fence = db.get(Fence, fence_id)
+        if fence is None:
+            raise HTTPException(status_code=404, detail="围栏不存在")
+        try:
+            polygon = _fence_polygon(body.geometry)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+
+        # 现有门线必须仍整条位于新有效区域内（不得越出新外环或穿过新孔洞）
+        gates = db.query(GateLineRow).filter_by(fence_id=fence_id).order_by(GateLineRow.id).all()
+        conflicts = []
+        for g in gates:
+            try:
+                _gate_line_within_polygon(json.loads(g.geometry), polygon)
+            except ValueError:
+                conflicts.append(g.id)
+        if conflicts:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "存在门线落到新有效区域外或穿过新孔洞，围栏调整已拒绝",
+                    "conflicting_gate_ids": conflicts,
+                },
+            )
+
+        try:
+            fence.name = body.name
+            fence.geometry = json.dumps(body.geometry)
+            fence.enter_buffer_m = body.config.enter_buffer_m
+            fence.exit_buffer_m = body.config.exit_buffer_m
+            fence.enter_dwell_s = body.config.enter_dwell_s
+            fence.exit_dwell_s = body.config.exit_dwell_s
+            fence.stay_min_s = body.config.stay_min_s
+            db.flush()  # 让后续重算读到新定义
+
+            # 围栏定义与该围栏全部设备的事件/状态/门线穿越一次提交；
+            # 只替换该围栏的衍生记录，其他围栏结果不变
+            recompute_fence(db, fence, commit=False)
+            db.commit()
+        except Exception:
+            # 重算失败不能留下新围栏配旧事件：定义更新与衍生结果整体回滚
+            db.rollback()
+            raise
+
+        db.refresh(fence)
     return fence_out(fence)
 
 
