@@ -27,6 +27,14 @@ class FenceCreate(BaseModel):
     config: FenceConfigSchema = FenceConfigSchema()
 
 
+class FenceUpdate(FenceCreate):
+    """调整已有围栏：整体替换名称、GeoJSON Polygon 与判定参数。
+
+    几何与参数校验与创建时完全一致；现有门线必须整体落在新有效区域内
+    （不得越出新外环或穿过新孔洞），否则整次调整被 422 拒绝。
+    """
+
+
 class FenceOut(BaseModel):
     id: int
     name: str
